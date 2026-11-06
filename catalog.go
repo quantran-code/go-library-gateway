@@ -20,6 +20,10 @@ const defaultCatalogURL = "http://localhost:8081"
 // development, used when LOANS_URL is not set.
 const defaultLoansURL = "http://localhost:8082"
 
+// requestIDHeader is the header that carries the browser's request id in both
+// directions through the gateway. The gateway copies it and never mints one.
+const requestIDHeader = "X-Request-Id"
+
 // catalogURLFromEnv reports the catalog service's address.
 func catalogURLFromEnv() string {
 	if url := os.Getenv("CATALOG_URL"); url != "" {
@@ -71,8 +75,10 @@ func catalogProxy(catalogURL string) http.HandlerFunc {
 // proxyTo forwards a request to baseURL with the /api prefix the browser uses
 // stripped off, carrying the incoming method and body upstream, so a POST
 // reaches the service that owns the resource. The upstream status code and
-// body are copied through unchanged. A transport failure answers 502 with
-// {"error": unavailableMessage}.
+// body are copied through unchanged. An incoming X-Request-Id is copied onto
+// the upstream request and the upstream's X-Request-Id is copied back to the
+// browser; the gateway never generates or replaces an id. A transport failure
+// answers 502 with {"error": unavailableMessage}.
 func proxyTo(baseURL string, unavailableMessage string) http.HandlerFunc {
 	client := &http.Client{Timeout: 10 * time.Second}
 
@@ -88,6 +94,9 @@ func proxyTo(baseURL string, unavailableMessage string) http.HandlerFunc {
 		if contentType := r.Header.Get("Content-Type"); contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
+		if requestID := r.Header.Get(requestIDHeader); requestID != "" {
+			req.Header.Set(requestIDHeader, requestID)
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -98,6 +107,9 @@ func proxyTo(baseURL string, unavailableMessage string) http.HandlerFunc {
 		defer func() { _ = resp.Body.Close() }()
 
 		w.Header().Set("Content-Type", "application/json")
+		if requestID := resp.Header.Get(requestIDHeader); requestID != "" {
+			w.Header().Set(requestIDHeader, requestID)
+		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
 	}
