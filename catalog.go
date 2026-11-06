@@ -54,6 +54,9 @@ func newRouterWithLoans(catalogURL string, loansURL string) http.Handler {
 	r.Get("/api/books", catalogProxy(catalogURL))
 	r.Get("/api/books/{id}", catalogProxy(catalogURL))
 	r.Post("/api/loans", proxyTo(loansURL, "loans unavailable"))
+	r.Post("/api/loans/{id}/return", proxyTo(loansURL, "loans unavailable"))
+	r.Get("/api/loans", proxyTo(loansURL, "loans unavailable"))
+	r.Get("/api/loans/{id}", proxyTo(loansURL, "loans unavailable"))
 	return r
 }
 
