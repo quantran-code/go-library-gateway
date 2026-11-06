@@ -19,5 +19,5 @@ func main() {
 // NewRouter wires the routes the gateway answers itself. Everything else is
 // forwarded to the service that owns the resource.
 func NewRouter() http.Handler {
-	return newRouter(catalogURLFromEnv())
+	return newRouterWithLoans(catalogURLFromEnv(), loansURLFromEnv())
 }

@@ -16,6 +16,10 @@ import (
 // development, used when CATALOG_URL is not set.
 const defaultCatalogURL = "http://localhost:8081"
 
+// defaultLoansURL is where the loans service listens during local
+// development, used when LOANS_URL is not set.
+const defaultLoansURL = "http://localhost:8082"
+
 // catalogURLFromEnv reports the catalog service's address.
 func catalogURLFromEnv() string {
 	if url := os.Getenv("CATALOG_URL"); url != "" {
@@ -24,9 +28,24 @@ func catalogURLFromEnv() string {
 	return defaultCatalogURL
 }
 
+// loansURLFromEnv reports the loans service's address.
+func loansURLFromEnv() string {
+	if url := os.Getenv("LOANS_URL"); url != "" {
+		return url
+	}
+	return defaultLoansURL
+}
+
 // newRouter wires the routes the gateway answers itself and the catalogue
-// routes it forwards to the catalog service.
+// routes it forwards to the catalog service, with the loans service at its
+// local development address.
 func newRouter(catalogURL string) http.Handler {
+	return newRouterWithLoans(catalogURL, defaultLoansURL)
+}
+
+// newRouterWithLoans wires the routes the gateway answers itself and the
+// catalogue and loans routes it forwards to the services that own them.
+func newRouterWithLoans(catalogURL string, loansURL string) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -34,6 +53,7 @@ func newRouter(catalogURL string) http.Handler {
 	})
 	r.Get("/api/books", catalogProxy(catalogURL))
 	r.Get("/api/books/{id}", catalogProxy(catalogURL))
+	r.Post("/api/loans", proxyTo(loansURL, "loans unavailable"))
 	return r
 }
 
@@ -42,22 +62,34 @@ func newRouter(catalogURL string) http.Handler {
 // status code and body are copied through unchanged, which is what carries the
 // catalog's 400 and 404 bodies to the browser verbatim.
 func catalogProxy(catalogURL string) http.HandlerFunc {
+	return proxyTo(catalogURL, "catalog unavailable")
+}
+
+// proxyTo forwards a request to baseURL with the /api prefix the browser uses
+// stripped off, carrying the incoming method and body upstream, so a POST
+// reaches the service that owns the resource. The upstream status code and
+// body are copied through unchanged. A transport failure answers 502 with
+// {"error": unavailableMessage}.
+func proxyTo(baseURL string, unavailableMessage string) http.HandlerFunc {
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		upstream := catalogURL + strings.TrimPrefix(r.URL.Path, "/api")
+		upstream := baseURL + strings.TrimPrefix(r.URL.Path, "/api")
 
-		req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream, nil)
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, upstream, r.Body)
 		if err != nil {
-			log.Printf("building catalog request for %s: %v", upstream, err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "catalog unavailable"})
+			log.Printf("building upstream request for %s: %v", upstream, err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": unavailableMessage})
 			return
+		}
+		if contentType := r.Header.Get("Content-Type"); contentType != "" {
+			req.Header.Set("Content-Type", contentType)
 		}
 
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("calling catalog at %s: %v", upstream, err)
-			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "catalog unavailable"})
+			log.Printf("calling upstream at %s: %v", upstream, err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": unavailableMessage})
 			return
 		}
 		defer func() { _ = resp.Body.Close() }()
