@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -469,5 +471,218 @@ func TestEachRequestLogsOneLineWithMethodPathStatusAndRequestID(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Request-Id"); got != id {
 		t.Fatalf("response X-Request-Id %q, want %q", got, id)
+	}
+}
+
+func TestBookImportForwardsTheMultipartBodyUnchanged(t *testing.T) {
+	const stubBody = `{"imported":1,"skipped":0}`
+	var gotMethod, gotPath, gotContentType string
+	var gotBody []byte
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "books.csv")
+	if err != nil {
+		t.Fatalf("creating the file part: %v", err)
+	}
+	if _, err := part.Write([]byte("title,author,available\r\nDune,Frank Herbert,true\r\n")); err != nil {
+		t.Fatalf("writing the file part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("closing the multipart writer: %v", err)
+	}
+	sent := body.Bytes()
+	contentType := mw.FormDataContentType()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/books/import", bytes.NewReader(sent))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("upstream received method %q, want POST", gotMethod)
+	}
+	if gotPath != "/books/import" {
+		t.Fatalf("upstream received path %q, want /books/import", gotPath)
+	}
+	if !bytes.Equal(gotBody, sent) {
+		t.Fatalf("upstream received body %q, want the bytes sent %q", gotBody, sent)
+	}
+	wantMediaType, wantParams, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatalf("parsing the sent Content-Type %q: %v", contentType, err)
+	}
+	gotMediaType, gotParams, err := mime.ParseMediaType(gotContentType)
+	if err != nil {
+		t.Fatalf("parsing the upstream Content-Type %q: %v", gotContentType, err)
+	}
+	if gotMediaType != wantMediaType || gotParams["boundary"] != wantParams["boundary"] {
+		t.Fatalf("upstream received Content-Type %q, want %q", gotContentType, contentType)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestBooksExportIsForwardedWithItsHeaders(t *testing.T) {
+	const (
+		stubBody        = "id,title,author,available\r\n1,\"Dune, \"\"Deluxe\"\"\",Frank Herbert,true\r\n"
+		stubContentType = "text/csv; charset=utf-8"
+		stubDisposition = `attachment; filename="books.csv"`
+	)
+	var gotMethod, gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", stubContentType)
+		w.Header().Set("Content-Disposition", stubDisposition)
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/books/export", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusOK)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("upstream received method %q, want GET", gotMethod)
+	}
+	if gotPath != "/books/export" {
+		t.Fatalf("upstream received path %q, want /books/export", gotPath)
+	}
+	if got := rec.Header().Get("Content-Type"); got != stubContentType {
+		t.Fatalf("Content-Type %q, want %q", got, stubContentType)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != stubDisposition {
+		t.Fatalf("Content-Disposition %q, want %q", got, stubDisposition)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want the CSV %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestLoansExportIsForwardedWithItsHeaders(t *testing.T) {
+	const (
+		stubBody        = "id,bookId,borrowedAt,dueAt,returnedAt\r\n7,1,2024-05-01T10:00:00Z,2024-05-15T10:00:00Z,\r\n"
+		stubContentType = "text/csv; charset=utf-8"
+		stubDisposition = `attachment; filename="loans.csv"`
+	)
+	var gotMethod, gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", stubContentType)
+		w.Header().Set("Content-Disposition", stubDisposition)
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("LOANS_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/loans/export", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusOK)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("upstream received method %q, want GET", gotMethod)
+	}
+	if gotPath != "/loans/export" {
+		t.Fatalf("upstream received path %q, want /loans/export", gotPath)
+	}
+	if got := rec.Header().Get("Content-Type"); got != stubContentType {
+		t.Fatalf("Content-Type %q, want %q", got, stubContentType)
+	}
+	if got := rec.Header().Get("Content-Disposition"); got != stubDisposition {
+		t.Fatalf("Content-Disposition %q, want %q", got, stubDisposition)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want the CSV %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestBookImportErrorStatusesArePassedThrough(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "unsupported file type", status: http.StatusUnsupportedMediaType, body: `{"error":"unsupported file type"}`},
+		{name: "file too large", status: http.StatusRequestEntityTooLarge, body: `{"error":"file too large"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer stub.Close()
+			t.Setenv("CATALOG_URL", stub.URL)
+
+			var body bytes.Buffer
+			mw := multipart.NewWriter(&body)
+			part, err := mw.CreateFormFile("file", "books.txt")
+			if err != nil {
+				t.Fatalf("creating the file part: %v", err)
+			}
+			if _, err := part.Write([]byte("title,author,available\r\n")); err != nil {
+				t.Fatalf("writing the file part: %v", err)
+			}
+			if err := mw.Close(); err != nil {
+				t.Fatalf("closing the multipart writer: %v", err)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/books/import", bytes.NewReader(body.Bytes()))
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			rec := httptest.NewRecorder()
+			NewRouter().ServeHTTP(rec, req)
+
+			if rec.Code != tc.status {
+				t.Fatalf("status %d, want %d", rec.Code, tc.status)
+			}
+			if gotPath != "/books/import" {
+				t.Fatalf("upstream received path %q, want /books/import", gotPath)
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("body %q, want %q", rec.Body.String(), tc.body)
+			}
+		})
+	}
+}
+
+func TestUnreachableCatalogAnswers502ForExport(t *testing.T) {
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	closedURL := stub.URL
+	stub.Close()
+	t.Setenv("CATALOG_URL", closedURL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/books/export", nil))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if body := rec.Body.String(); body != "" {
+		t.Fatalf("body %q, want no file at all", body)
 	}
 }

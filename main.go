@@ -46,6 +46,8 @@ func NewRouter() http.Handler {
 	}
 	catalogProxy := newServiceProxy(catalogTarget)
 	r.Get("/api/books", catalogProxy.ServeHTTP)
+	r.Post("/api/books/import", catalogProxy.ServeHTTP)
+	r.Get("/api/books/export", catalogProxy.ServeHTTP)
 	r.Get("/api/books/{id}", catalogProxy.ServeHTTP)
 
 	loansTarget, err := url.Parse(loansURL())
@@ -56,6 +58,7 @@ func NewRouter() http.Handler {
 	loansProxy := newServiceProxy(loansTarget)
 	r.Post("/api/loans", loansProxy.ServeHTTP)
 	r.Get("/api/loans", loansProxy.ServeHTTP)
+	r.Get("/api/loans/export", loansProxy.ServeHTTP)
 	r.Get("/api/loans/{id}", loansProxy.ServeHTTP)
 	r.Post("/api/loans/{id}/return", loansProxy.ServeHTTP)
 	return withRequestID(r)
