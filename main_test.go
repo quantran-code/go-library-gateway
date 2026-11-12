@@ -164,3 +164,149 @@ func TestUnreachableLoansAnswers502(t *testing.T) {
 		t.Fatalf("status %d, want %d", rec.Code, http.StatusBadGateway)
 	}
 }
+
+func TestLoansListIsForwardedToTheLoansService(t *testing.T) {
+	const stubBody = `[{"id":2,"bookId":1,"borrowedAt":"2024-05-01T10:00:00Z","dueAt":"2024-05-15T10:00:00Z"},{"id":1,"bookId":2,"borrowedAt":"2024-04-01T10:00:00Z","dueAt":"2024-04-15T10:00:00Z"}]`
+	var gotMethod, gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("LOANS_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/loans", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("upstream received method %q, want GET", gotMethod)
+	}
+	if gotPath != "/loans" {
+		t.Fatalf("upstream received path %q, want /loans", gotPath)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestLoanDetailIsForwardedWithTheId(t *testing.T) {
+	const stubBody = `{"id":7,"bookId":1,"borrowedAt":"2024-05-01T10:00:00Z","dueAt":"2024-05-15T10:00:00Z"}`
+	var gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("LOANS_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/loans/7", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if gotPath != "/loans/7" {
+		t.Fatalf("upstream received path %q, want /loans/7", gotPath)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestReturnIsForwardedToTheLoansService(t *testing.T) {
+	const stubBody = `{"id":7,"bookId":1,"borrowedAt":"2024-05-01T10:00:00Z","dueAt":"2024-05-15T10:00:00Z","returnedAt":"2024-05-10T09:30:00Z"}`
+	var gotMethod, gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("LOANS_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/loans/7/return", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("upstream received method %q, want POST", gotMethod)
+	}
+	if gotPath != "/loans/7/return" {
+		t.Fatalf("upstream received path %q, want /loans/7/return", gotPath)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestLoanErrorStatusesArePassedThrough(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{name: "invalid loan id", method: http.MethodPost, path: "/api/loans/abc/return", status: http.StatusBadRequest, body: `{"error":"invalid loan id"}`},
+		{name: "unknown loan", method: http.MethodGet, path: "/api/loans/999", status: http.StatusNotFound, body: `{"error":"loan not found"}`},
+		{name: "loan already returned", method: http.MethodPost, path: "/api/loans/7/return", status: http.StatusConflict, body: `{"error":"loan already returned"}`},
+		{name: "catalog unavailable", method: http.MethodPost, path: "/api/loans/7/return", status: http.StatusBadGateway, body: `{"error":"catalog unavailable"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer stub.Close()
+			t.Setenv("LOANS_URL", stub.URL)
+
+			rec := httptest.NewRecorder()
+			NewRouter().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+
+			if rec.Code != tc.status {
+				t.Fatalf("status %d, want %d", rec.Code, tc.status)
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("body %q, want %q", rec.Body.String(), tc.body)
+			}
+			if want := strings.TrimPrefix(tc.path, "/api"); gotPath != want {
+				t.Fatalf("upstream received path %q, want %q", gotPath, want)
+			}
+		})
+	}
+}
+
+func TestLoansNonNumericIdIsForwardedUnchanged(t *testing.T) {
+	var gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid loan id"}`))
+	}))
+	defer stub.Close()
+	t.Setenv("LOANS_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/loans/abc", nil))
+
+	if gotPath != "/loans/abc" {
+		t.Fatalf("upstream received path %q, want /loans/abc", gotPath)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}

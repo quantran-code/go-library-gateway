@@ -55,6 +55,9 @@ func NewRouter() http.Handler {
 	}
 	loansProxy := newServiceProxy(loansTarget)
 	r.Post("/api/loans", loansProxy.ServeHTTP)
+	r.Get("/api/loans", loansProxy.ServeHTTP)
+	r.Get("/api/loans/{id}", loansProxy.ServeHTTP)
+	r.Post("/api/loans/{id}/return", loansProxy.ServeHTTP)
 	return r
 }
 
