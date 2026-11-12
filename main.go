@@ -26,6 +26,10 @@ func main() {
 // not set.
 const defaultCatalogURL = "http://localhost:8081"
 
+// defaultLoansURL is where the loans service listens when LOANS_URL is not
+// set.
+const defaultLoansURL = "http://localhost:8082"
+
 // NewRouter wires the routes the gateway answers itself. Everything else is
 // forwarded to the service that owns the resource.
 func NewRouter() http.Handler {
@@ -35,14 +39,22 @@ func NewRouter() http.Handler {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
 
-	target, err := url.Parse(catalogURL())
+	catalogTarget, err := url.Parse(catalogURL())
 	if err != nil {
 		log.Printf("invalid CATALOG_URL %q, using %s: %v", catalogURL(), defaultCatalogURL, err)
-		target, _ = url.Parse(defaultCatalogURL)
+		catalogTarget, _ = url.Parse(defaultCatalogURL)
 	}
-	proxy := newCatalogProxy(target)
-	r.Get("/api/books", proxy.ServeHTTP)
-	r.Get("/api/books/{id}", proxy.ServeHTTP)
+	catalogProxy := newServiceProxy(catalogTarget)
+	r.Get("/api/books", catalogProxy.ServeHTTP)
+	r.Get("/api/books/{id}", catalogProxy.ServeHTTP)
+
+	loansTarget, err := url.Parse(loansURL())
+	if err != nil {
+		log.Printf("invalid LOANS_URL %q, using %s: %v", loansURL(), defaultLoansURL, err)
+		loansTarget, _ = url.Parse(defaultLoansURL)
+	}
+	loansProxy := newServiceProxy(loansTarget)
+	r.Post("/api/loans", loansProxy.ServeHTTP)
 	return r
 }
 
@@ -54,9 +66,18 @@ func catalogURL() string {
 	return defaultCatalogURL
 }
 
-// newCatalogProxy forwards to the catalog service, stripping the /api prefix
-// so /api/books reaches the service as /books and /api/books/7 as /books/7.
-func newCatalogProxy(target *url.URL) http.Handler {
+// loansURL reports the base URL of the loans service.
+func loansURL() string {
+	if u := os.Getenv("LOANS_URL"); u != "" {
+		return u
+	}
+	return defaultLoansURL
+}
+
+// newServiceProxy forwards to a service, stripping the /api prefix so
+// /api/books reaches the catalog as /books, /api/books/7 as /books/7 and
+// /api/loans reaches the loans service as /loans.
+func newServiceProxy(target *url.URL) http.Handler {
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	director := proxy.Director
 	proxy.Director = func(req *http.Request) {
