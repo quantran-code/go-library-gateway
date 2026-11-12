@@ -58,7 +58,7 @@ func NewRouter() http.Handler {
 	r.Get("/api/loans", loansProxy.ServeHTTP)
 	r.Get("/api/loans/{id}", loansProxy.ServeHTTP)
 	r.Post("/api/loans/{id}/return", loansProxy.ServeHTTP)
-	return r
+	return withRequestID(r)
 }
 
 // catalogURL reports the base URL of the catalog service.
@@ -87,6 +87,7 @@ func newServiceProxy(target *url.URL) http.Handler {
 		director(req)
 		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api")
 		req.URL.RawPath = ""
+		req.Header.Set(requestIDHeader, requestIDFrom(req.Context()))
 	}
 	return proxy
 }

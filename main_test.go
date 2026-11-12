@@ -1,12 +1,30 @@
 package main
 
 import (
+	"bytes"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// requestIDPattern matches the 32 lowercase hex characters a minted request id
+// is made of.
+var requestIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// nonEmptyLines splits captured log output into the lines that carry text.
+func nonEmptyLines(s string) []string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
 
 func TestHealthReportsTheGatewayIsUp(t *testing.T) {
 	rec := httptest.NewRecorder()
@@ -308,5 +326,148 @@ func TestLoansNonNumericIdIsForwardedUnchanged(t *testing.T) {
 	}
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+}
+
+func TestRequestIDIsPreservedForwardedAndEchoed(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{name: "32 hex characters", id: "9f2c4a1e7b3d4086a5c2e1f0b7d39a64"},
+		{name: "a value the caller made up", id: "client-abc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotHeader string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotHeader = r.Header.Get("X-Request-Id")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`[]`))
+			}))
+			defer stub.Close()
+			t.Setenv("CATALOG_URL", stub.URL)
+
+			req := httptest.NewRequest(http.MethodGet, "/api/books", nil)
+			req.Header.Set("X-Request-Id", tc.id)
+			rec := httptest.NewRecorder()
+			NewRouter().ServeHTTP(rec, req)
+
+			if gotHeader != tc.id {
+				t.Fatalf("upstream received X-Request-Id %q, want %q", gotHeader, tc.id)
+			}
+			if got := rec.Header().Get("X-Request-Id"); got != tc.id {
+				t.Fatalf("response X-Request-Id %q, want %q", got, tc.id)
+			}
+		})
+	}
+}
+
+func TestRequestIDIsMintedWhenTheCallerSendsNone(t *testing.T) {
+	var gotHeader string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Request-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/books", nil))
+
+	if !requestIDPattern.MatchString(gotHeader) {
+		t.Fatalf("upstream received X-Request-Id %q, want 32 lowercase hex characters", gotHeader)
+	}
+	if got := rec.Header().Get("X-Request-Id"); got != gotHeader {
+		t.Fatalf("response X-Request-Id %q, want the forwarded %q", got, gotHeader)
+	}
+}
+
+func TestGatewayGenerated404CarriesTheRequestID(t *testing.T) {
+	const id = "9f2c4a1e7b3d4086a5c2e1f0b7d39a64"
+
+	t.Run("caller supplied id", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/unknown", nil)
+		req.Header.Set("X-Request-Id", id)
+		rec := httptest.NewRecorder()
+		NewRouter().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status %d, want %d", rec.Code, http.StatusNotFound)
+		}
+		if got := rec.Header().Get("X-Request-Id"); got != id {
+			t.Fatalf("response X-Request-Id %q, want %q", got, id)
+		}
+	})
+
+	t.Run("no inbound id", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/unknown", nil))
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status %d, want %d", rec.Code, http.StatusNotFound)
+		}
+		if got := rec.Header().Get("X-Request-Id"); !requestIDPattern.MatchString(got) {
+			t.Fatalf("response X-Request-Id %q, want 32 lowercase hex characters", got)
+		}
+	})
+}
+
+func TestGatewayGenerated502CarriesTheRequestID(t *testing.T) {
+	const id = "9f2c4a1e7b3d4086a5c2e1f0b7d39a64"
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	closedURL := stub.URL
+	stub.Close()
+	t.Setenv("CATALOG_URL", closedURL)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/books", nil)
+	req.Header.Set("X-Request-Id", id)
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusBadGateway)
+	}
+	if got := rec.Header().Get("X-Request-Id"); got != id {
+		t.Fatalf("response X-Request-Id %q, want %q", got, id)
+	}
+}
+
+func TestEachRequestLogsOneLineWithMethodPathStatusAndRequestID(t *testing.T) {
+	const id = "9f2c4a1e7b3d4086a5c2e1f0b7d39a64"
+	var gotHeader string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Request-Id")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	var buf bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(previous)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/books", nil)
+	req.Header.Set("X-Request-Id", id)
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+
+	lines := nonEmptyLines(buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("logged %d lines, want 1: %q", len(lines), buf.String())
+	}
+	for _, want := range []string{"method=GET", "path=/api/books", "status=200", "request_id=" + id} {
+		if !strings.Contains(lines[0], want) {
+			t.Fatalf("log line %q does not contain %q", lines[0], want)
+		}
+	}
+	if gotHeader != id {
+		t.Fatalf("upstream received X-Request-Id %q, want %q", gotHeader, id)
+	}
+	if got := rec.Header().Get("X-Request-Id"); got != id {
+		t.Fatalf("response X-Request-Id %q, want %q", got, id)
 	}
 }
