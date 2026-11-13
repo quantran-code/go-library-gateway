@@ -686,3 +686,140 @@ func TestUnreachableCatalogAnswers502ForExport(t *testing.T) {
 		t.Fatalf("body %q, want no file at all", body)
 	}
 }
+
+func TestImportJobSubmitIsForwardedUnchanged(t *testing.T) {
+	const stubBody = `{"jobId":"9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64","status":"queued","totalRows":2,"batchSize":100,"batches":1}`
+	var gotMethod, gotPath, gotContentType string
+	var gotBody []byte
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "books.csv")
+	if err != nil {
+		t.Fatalf("creating the file part: %v", err)
+	}
+	if _, err := part.Write([]byte("title,author,available\r\nDune,Frank Herbert,true\r\n")); err != nil {
+		t.Fatalf("writing the file part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("closing the multipart writer: %v", err)
+	}
+	sent := body.Bytes()
+	contentType := mw.FormDataContentType()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/books/import-jobs", bytes.NewReader(sent))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusAccepted)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("upstream received method %q, want POST", gotMethod)
+	}
+	if gotPath != "/books/import-jobs" {
+		t.Fatalf("upstream received path %q, want /books/import-jobs", gotPath)
+	}
+	if !bytes.Equal(gotBody, sent) {
+		t.Fatalf("upstream received body %q, want the bytes sent %q", gotBody, sent)
+	}
+	wantMediaType, wantParams, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatalf("parsing the sent Content-Type %q: %v", contentType, err)
+	}
+	gotMediaType, gotParams, err := mime.ParseMediaType(gotContentType)
+	if err != nil {
+		t.Fatalf("parsing the upstream Content-Type %q: %v", gotContentType, err)
+	}
+	if gotMediaType != wantMediaType || gotParams["boundary"] != wantParams["boundary"] {
+		t.Fatalf("upstream received Content-Type %q, want %q", gotContentType, contentType)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestImportJobStatusIsForwarded(t *testing.T) {
+	const (
+		jobID    = "9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64"
+		stubBody = `{"jobId":"9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64","status":"processing","totalRows":250,"processedRows":100,"imported":100,"skipped":0,"batches":3,"completedBatches":1,"errors":[],"more":false,"createdAt":"2024-05-01T10:00:00Z","updatedAt":"2024-05-01T10:00:01Z"}`
+	)
+	var gotMethod, gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/books/import-jobs/"+jobID, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusOK)
+	}
+	if gotMethod != http.MethodGet {
+		t.Fatalf("upstream received method %q, want GET", gotMethod)
+	}
+	if want := "/books/import-jobs/" + jobID; gotPath != want {
+		t.Fatalf("upstream received path %q, want %q", gotPath, want)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestImportJobErrorStatusesArePassedThrough(t *testing.T) {
+	const jobID = "9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64"
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{name: "invalid import file", method: http.MethodPost, path: "/api/books/import-jobs", status: http.StatusBadRequest, body: `{"error":"invalid import file","rows":[{"line":2,"error":"title is required"}],"more":false}`},
+		{name: "unknown job", method: http.MethodGet, path: "/api/books/import-jobs/" + jobID, status: http.StatusNotFound, body: `{"error":"job not found"}`},
+		{name: "queue unavailable", method: http.MethodPost, path: "/api/books/import-jobs", status: http.StatusServiceUnavailable, body: `{"error":"queue unavailable"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer stub.Close()
+			t.Setenv("CATALOG_URL", stub.URL)
+
+			rec := httptest.NewRecorder()
+			NewRouter().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+
+			if rec.Code != tc.status {
+				t.Fatalf("status %d, want %d", rec.Code, tc.status)
+			}
+			if want := strings.TrimPrefix(tc.path, "/api"); gotPath != want {
+				t.Fatalf("upstream received path %q, want %q", gotPath, want)
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("body %q, want %q", rec.Body.String(), tc.body)
+			}
+		})
+	}
+}

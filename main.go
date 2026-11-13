@@ -48,6 +48,8 @@ func NewRouter() http.Handler {
 	r.Get("/api/books", catalogProxy.ServeHTTP)
 	r.Post("/api/books/import", catalogProxy.ServeHTTP)
 	r.Get("/api/books/export", catalogProxy.ServeHTTP)
+	r.Post("/api/books/import-jobs", catalogProxy.ServeHTTP)
+	r.Get("/api/books/import-jobs/{jobId}", catalogProxy.ServeHTTP)
 	r.Get("/api/books/{id}", catalogProxy.ServeHTTP)
 
 	loansTarget, err := url.Parse(loansURL())
