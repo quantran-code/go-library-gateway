@@ -823,3 +823,119 @@ func TestImportJobErrorStatusesArePassedThrough(t *testing.T) {
 		})
 	}
 }
+
+func TestFilesUploadIsProxiedUnchanged(t *testing.T) {
+	const stubBody = `{"key":"uploads/9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64.csv","url":"http://localhost:9000/octiq-uploads/uploads/9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64.csv?X-Amz-Signature=abc123","expiresAt":"2024-05-01T10:15:00Z","size":41,"contentType":"text/csv"}`
+	var gotMethod, gotPath, gotContentType string
+	var gotBody []byte
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		gotContentType = r.Header.Get("Content-Type")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(stubBody))
+	}))
+	defer stub.Close()
+	t.Setenv("CATALOG_URL", stub.URL)
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	part, err := mw.CreateFormFile("file", "books.csv")
+	if err != nil {
+		t.Fatalf("creating the file part: %v", err)
+	}
+	if _, err := part.Write([]byte("title,author,available\r\nDune,Frank Herbert,true\r\n")); err != nil {
+		t.Fatalf("writing the file part: %v", err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatalf("closing the multipart writer: %v", err)
+	}
+	sent := body.Bytes()
+	contentType := mw.FormDataContentType()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/files", bytes.NewReader(sent))
+	req.Header.Set("Content-Type", contentType)
+	rec := httptest.NewRecorder()
+	NewRouter().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status %d, want %d", rec.Code, http.StatusCreated)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("upstream received method %q, want POST", gotMethod)
+	}
+	if gotPath != "/files" {
+		t.Fatalf("upstream received path %q, want /files", gotPath)
+	}
+	if !bytes.Equal(gotBody, sent) {
+		t.Fatalf("upstream received body %q, want the bytes sent %q", gotBody, sent)
+	}
+	wantMediaType, wantParams, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatalf("parsing the sent Content-Type %q: %v", contentType, err)
+	}
+	gotMediaType, gotParams, err := mime.ParseMediaType(gotContentType)
+	if err != nil {
+		t.Fatalf("parsing the upstream Content-Type %q: %v", gotContentType, err)
+	}
+	if gotMediaType != wantMediaType || gotParams["boundary"] != wantParams["boundary"] {
+		t.Fatalf("upstream received Content-Type %q, want %q", gotContentType, contentType)
+	}
+	if rec.Body.String() != stubBody {
+		t.Fatalf("body %q, want %q", rec.Body.String(), stubBody)
+	}
+}
+
+func TestS3RoutesAreProxiedWithStatusAndBody(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{name: "upload created", method: http.MethodPost, path: "/api/files", status: http.StatusCreated, body: `{"key":"uploads/9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64.csv","url":"http://localhost:9000/octiq-uploads/uploads/9f2c4a1e-7b3d-4086-a5c2-e1f0b7d39a64.csv?X-Amz-Signature=abc123","expiresAt":"2024-05-01T10:15:00Z","size":41,"contentType":"text/csv"}`},
+		{name: "import from s3 created", method: http.MethodPost, path: "/api/books/import-s3", status: http.StatusCreated, body: `{"imported":2,"skipped":0}`},
+		{name: "books export created", method: http.MethodPost, path: "/api/books/export-s3", status: http.StatusCreated, body: `{"key":"exports/books/1b2c3d4e-5f60-4718-9a2b-3c4d5e6f7081.csv","url":"http://localhost:9000/octiq-uploads/exports/books/1b2c3d4e-5f60-4718-9a2b-3c4d5e6f7081.csv?X-Amz-Signature=abc123","expiresAt":"2024-05-01T10:15:00Z","size":64}`},
+		{name: "loans export created", method: http.MethodPost, path: "/api/loans/export-s3", status: http.StatusCreated, body: `{"key":"exports/loans/2c3d4e5f-6071-4829-8b3c-4d5e6f708192.csv","url":"http://localhost:9000/octiq-uploads/exports/loans/2c3d4e5f-6071-4829-8b3c-4d5e6f708192.csv?X-Amz-Signature=abc123","expiresAt":"2024-05-01T10:15:00Z","size":72}`},
+		{name: "invalid import file", method: http.MethodPost, path: "/api/books/import-s3", status: http.StatusBadRequest, body: `{"error":"invalid import file","rows":[{"line":2,"error":"title is required"}],"more":false}`},
+		{name: "missing object", method: http.MethodPost, path: "/api/books/import-s3", status: http.StatusNotFound, body: `{"error":"file not found"}`},
+		{name: "oversized object", method: http.MethodPost, path: "/api/books/import-s3", status: http.StatusRequestEntityTooLarge, body: `{"error":"file too large"}`},
+		{name: "unsupported file type", method: http.MethodPost, path: "/api/files", status: http.StatusUnsupportedMediaType, body: `{"error":"unsupported file type"}`},
+		{name: "books export storage unavailable", method: http.MethodPost, path: "/api/books/export-s3", status: http.StatusBadGateway, body: `{"error":"storage unavailable"}`},
+		{name: "loans export storage not configured", method: http.MethodPost, path: "/api/loans/export-s3", status: http.StatusServiceUnavailable, body: `{"error":"storage unavailable"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotMethod, gotPath string
+			stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotMethod = r.Method
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer stub.Close()
+			t.Setenv("CATALOG_URL", stub.URL)
+			t.Setenv("LOANS_URL", stub.URL)
+
+			rec := httptest.NewRecorder()
+			NewRouter().ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{"key":"uploads/example.csv"}`)))
+
+			if rec.Code != tc.status {
+				t.Fatalf("status %d, want %d", rec.Code, tc.status)
+			}
+			if gotMethod != tc.method {
+				t.Fatalf("upstream received method %q, want %q", gotMethod, tc.method)
+			}
+			if want := strings.TrimPrefix(tc.path, "/api"); gotPath != want {
+				t.Fatalf("upstream received path %q, want %q", gotPath, want)
+			}
+			if rec.Body.String() != tc.body {
+				t.Fatalf("body %q, want %q", rec.Body.String(), tc.body)
+			}
+		})
+	}
+}
